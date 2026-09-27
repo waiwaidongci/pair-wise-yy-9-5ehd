@@ -3,11 +3,16 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { GATED_STEPS, REVIEW_STATUS, changedQualificationFields, checkOperator, relatedUndelivered, staffFlags, validateRegistration } from "./qualification-rules.js";
+import { addStaff, appendHistory, ensureStaffShape, findStaff, listHistory, listStaff, updateStaff } from "./staff-store.js";
+import { staffPage } from "./staff-page.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const dbPath = join(__dirname, "data", "cyanotype-negative-room.json");
 const port = Number(process.env.PORT || 3040);
 const seed = {
+  "staff": [],
+  "staffHistory": [],
   "items": [
     {
       "code": "CN-001",
@@ -29,8 +34,8 @@ const seed = {
   ]
 };
 const fields = [["code","底片编号","text"],["plateSize","玻璃板尺寸","text"],["chemicalBatch","药液批次","text"],["exposure","曝光时间","text"],["waterSource","冲洗水源","text"],["box","存放盒位","text"]];
-const stages = ["待曝光","冲洗中","待入盒","已交付"];
-const statLabels = ["待曝光","冲洗中","待入盒","已交付"];
+const stages = ["待曝光","冲洗中","待入盒",REVIEW_STATUS,"已交付"];
+const statLabels = stages;
 const extraFields = [["step","步骤"],["developStatus","显影状态"],["defect","缺陷类型"],["repair","修补记录"],["note","备注"]];
 
 async function loadDb() {
@@ -86,15 +91,16 @@ function page() {
     .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:12px; } .card { display:grid; gap:8px; }
     .meta { color:var(--muted); font-size:13px; } .pill { display:inline-block; border:1px solid var(--line); border-radius:999px; padding:3px 8px; font-size:12px; }
     .logs { border-top:1px solid var(--line); padding-top:8px; max-height:90px; overflow:auto; } .warn { color:var(--warn); font-weight:700; }
+    a { color:var(--accent); } .form-msg { margin-top:8px; min-height:18px; }
     @media (max-width:900px){ header{display:block;padding:18px 16px;} main{grid-template-columns:1fr;padding:16px;} }
   </style>
 </head>
 <body>
-  <header><div><h1>古法蓝晒底片整理室</h1><div class="meta">底片任务、工艺步骤、缺陷和入盒交付</div></div><button id="reload">刷新</button></header>
+  <header><div><h1>古法蓝晒底片整理室</h1><div class="meta">底片任务、工艺步骤、缺陷和入盒交付 · <a href="/staff">上岗资格台</a></div></div><button id="reload">刷新</button></header>
   <main>
     <section>
-      <form id="createForm"><h2>新增底片</h2><div id="fields"></div><label>初始状态</label><select name="status">${stages.map(s => '<option>'+s+'</option>').join('')}</select><button>保存底片</button></form>
-      <form id="actionForm" style="margin-top:14px"><h2>记录工艺步骤</h2><label>选择底片</label><select name="id" id="itemSelect"></select><div id="extraFields"></div><button>提交记录</button></form>
+      <form id="createForm"><h2>新增底片</h2><div id="fields"></div><label>初始状态</label><select name="status">${stages.map(s => '<option>'+s+'</option>').join('')}</select><button>保存底片</button><div id="createMsg" class="form-msg warn"></div></form>
+      <form id="actionForm" style="margin-top:14px"><h2>记录工艺步骤</h2><label>选择底片</label><select name="id" id="itemSelect"></select><label>操作人员（涂布/曝光/冲洗必选）</label><select name="operator" id="operatorSelect"></select><div id="extraFields"></div><button>提交记录</button><div id="actionMsg" class="form-msg warn"></div></form>
     </section>
     <section>
       <div class="stats" id="stats"></div>
@@ -104,14 +110,15 @@ function page() {
   </main>
   <script>
     const fields = [["code","底片编号","text"],["plateSize","玻璃板尺寸","text"],["chemicalBatch","药液批次","text"],["exposure","曝光时间","text"],["waterSource","冲洗水源","text"],["box","存放盒位","text"]];
-    const stages = ["待曝光","冲洗中","待入盒","已交付"];
+    const stages = ${JSON.stringify(stages)};
     const extraFields = [["step","步骤"],["developStatus","显影状态"],["defect","缺陷类型"],["repair","修补记录"],["note","备注"]];
     const createForm = document.querySelector('#createForm');
     const actionForm = document.querySelector('#actionForm');
     const cards = document.querySelector('#cards');
     const statsEl = document.querySelector('#stats');
     const itemSelect = document.querySelector('#itemSelect');
-    let items = [];
+    const operatorSelect = document.querySelector('#operatorSelect');
+    let items = [], staffList = [];
     async function api(path, options) {
       const res = await fetch(path, options && options.body ? { ...options, headers:{ 'Content-Type':'application/json' } } : options);
       const data = await res.json();
@@ -124,6 +131,7 @@ function page() {
     }
     function render() {
       itemSelect.innerHTML = items.map(item => '<option value="'+(item.id || item.code)+'">'+(item.code || item.id)+' · '+(item.name || item.shipType || item.source || item.plateSize || '')+'</option>').join('');
+      operatorSelect.innerHTML = '<option value="">请选择操作人员</option>' + staffList.map(s => '<option value="'+s.id+'">'+s.name+' · '+s.team+' · '+s.shiftStart+'-'+s.shiftEnd+((s.flags || []).some(f => f !== '在岗中') ? '（'+(s.flags || []).join('、')+'）' : '')+'</option>').join('');
       const stats = Object.fromEntries(stages.map(s => [s, items.filter(i => i.status === s).length]));
       statsEl.innerHTML = Object.entries(stats).map(([k,v]) => '<div class="stat"><span>'+k+'</span><strong>'+v+'</strong></div>').join('');
       const status = document.querySelector('#statusFilter').value;
@@ -136,12 +144,12 @@ function page() {
     function cardHtml(item) {
       const main = fields.slice(0,4).map(([key,label]) => '<div><b>'+label+'</b> '+(item[key] ?? '')+'</div>').join('');
       const tasks = (item.tasks || []).map(t => '<div class="meta">任务 '+t.position+' · '+t.status+' · '+t.tension+'</div>').join('');
-      const logs = (item.logs || []).slice(-4).map(l => '<div>'+l.step+'：'+l.note+'</div>').join('');
+      const logs = (item.logs || []).slice(-4).map(l => '<div>'+l.step+(l.operator ? ' · '+l.operator : '')+'：'+(l.note || '')+'</div>').join('');
       return '<article class="card"><h3>'+(item.code || item.id)+'</h3><span class="pill">'+item.status+'</span>'+main+tasks+'<label>状态</label><select data-status="'+(item.id || item.code)+'">'+stages.map(s => '<option '+(s===item.status?'selected':'')+'>'+s+'</option>').join('')+'</select><button class="secondary" data-note="'+(item.id || item.code)+'">追加备注</button><div class="logs meta">'+(logs || '暂无记录')+'</div></article>';
     }
-    async function load() { items = await api('/api/items'); render(); }
-    createForm.onsubmit = async event => { event.preventDefault(); await api('/api/items', { method:'POST', body: JSON.stringify(Object.fromEntries(new FormData(createForm).entries())) }); createForm.reset(); await load(); };
-    actionForm.onsubmit = async event => { event.preventDefault(); await api('/api/items/'+itemSelect.value+'/action', { method:'POST', body: JSON.stringify(Object.fromEntries(new FormData(actionForm).entries())) }); actionForm.reset(); await load(); };
+    async function load() { const [its, st] = await Promise.all([api('/api/items'), api('/api/staff')]); items = its; staffList = st; render(); }
+    createForm.onsubmit = async event => { event.preventDefault(); const msg = document.querySelector('#createMsg'); try { await api('/api/items', { method:'POST', body: JSON.stringify(Object.fromEntries(new FormData(createForm).entries())) }); createForm.reset(); msg.textContent = ''; await load(); } catch (e) { msg.textContent = e.message; } };
+    actionForm.onsubmit = async event => { event.preventDefault(); const msg = document.querySelector('#actionMsg'); try { await api('/api/items/'+itemSelect.value+'/action', { method:'POST', body: JSON.stringify(Object.fromEntries(new FormData(actionForm).entries())) }); actionForm.reset(); msg.textContent = ''; await load(); } catch (e) { msg.textContent = e.message; } };
     document.querySelector('#statusFilter').onchange = render; document.querySelector('#search').oninput = render; document.querySelector('#reload').onclick = load;
     renderForms(); load();
   </script>
@@ -152,8 +160,42 @@ function page() {
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
-    const db = await loadDb();
+    const db = ensureStaffShape(await loadDb());
     if (req.method === "GET" && url.pathname === "/") return html(res, page());
+    if (req.method === "GET" && url.pathname === "/staff") return html(res, staffPage());
+    if (req.method === "GET" && url.pathname === "/api/staff") {
+      const staff = listStaff(db);
+      return send(res, 200, staff.map(r => ({ ...r, flags: staffFlags(r, staff) })));
+    }
+    if (req.method === "GET" && url.pathname === "/api/staff/history") return send(res, 200, listHistory(db));
+    if (req.method === "POST" && url.pathname === "/api/staff") {
+      const { errors, record } = validateRegistration(await body(req), listStaff(db));
+      if (errors.length) return send(res, 400, { error: "已停下，登记未写入：" + errors.join("；"), reasons: errors });
+      const saved = addStaff(db, record);
+      await saveDb(db);
+      return send(res, 201, saved);
+    }
+    const staffPatch = url.pathname.match(/^\/api\/staff\/([^/]+)$/);
+    if (staffPatch && req.method === "PATCH") {
+      const current = findStaff(db, staffPatch[1]);
+      if (!current) return send(res, 404, { error: "staff_not_found" });
+      const { errors, record } = validateRegistration({ ...current, ...(await body(req)) }, listStaff(db), current.id);
+      if (errors.length) return send(res, 400, { error: "已停下，修改未写入：" + errors.join("；"), reasons: errors });
+      const changed = changedQualificationFields(current, record);
+      const { before, after } = updateStaff(db, current.id, record);
+      const returned = changed.length ? relatedUndelivered(db.items, after) : [];
+      for (const item of returned) {
+        item.status = REVIEW_STATUS;
+        item.logs ||= [];
+        item.logs.push({ at: new Date().toISOString(), step: "复核", note: "资格变更（" + changed.join("、") + "）：" + after.name + " 相关底片退回待复核" });
+      }
+      if (changed.length) {
+        const snap = r => ({ name: r.name, team: r.team, shiftStart: r.shiftStart, shiftEnd: r.shiftEnd, processes: r.processes, certValidUntil: r.certValidUntil });
+        appendHistory(db, { staffId: after.id, name: after.name, changedFields: changed, before: snap(before), after: snap(after), returned: returned.map(i => i.code || i.id) });
+      }
+      await saveDb(db);
+      return send(res, 200, { record: after, changedFields: changed, returned: returned.map(i => i.code || i.id) });
+    }
     if (req.method === "GET" && url.pathname === "/api/items") return send(res, 200, db.items.map(summarize));
     if (req.method === "POST" && url.pathname === "/api/items") {
       const input = await body(req);
@@ -188,15 +230,30 @@ const server = http.createServer(async (req, res) => {
       const item = db.items.find(x => x.id === action[1] || x.code === action[1]);
       if (!item) return send(res, 404, { error: "item_not_found" });
       const input = await body(req);
+      let operator = null;
+      if (GATED_STEPS.includes(input.step)) {
+        if (!input.operator) return send(res, 409, { error: "已停下，原记录未写入：提交" + input.step + "必须选择操作人员" });
+        const check = checkOperator(listStaff(db), { id: input.operator, step: input.step });
+        if (!check.ok) return send(res, 409, { error: "已停下，原记录未写入：" + check.reasons.join("；"), reasons: check.reasons });
+        operator = check.record;
+      }
       item.logs ||= [];
       item.steps ||= [];
-      item.steps.push({ at: new Date().toISOString(), ...input });
+      const stepRecord = { at: new Date().toISOString(), ...input };
+      delete stepRecord.id;
+      if (operator) {
+        stepRecord.operatorId = operator.id;
+        stepRecord.operator = operator.name;
+      } else {
+        delete stepRecord.operator;
+      }
+      item.steps.push(stepRecord);
       if (input.defect) item.defect = input.defect;
       if (input.step === "冲洗") item.status = "冲洗中";
       else if (input.step === "入盒") item.status = "待入盒";
       else if (input.step === "交付") item.status = "已交付";
       else item.status = "待曝光";
-      item.logs.push({ at: new Date().toISOString(), step: input.step || "工艺", note: input.note || input.developStatus || "步骤记录" });
+      item.logs.push({ at: new Date().toISOString(), step: input.step || "工艺", note: input.note || input.developStatus || "步骤记录", ...(operator ? { operator: operator.name, operatorId: operator.id } : {}) });
       await saveDb(db);
       return send(res, 201, item);
     }
