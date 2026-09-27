@@ -1,46 +1,14 @@
 import http from "node:http";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { loadDb, saveDb, findWorker, newWorkerId } from "./qualification-store.js";
+import { QUALIFIED_STEPS, normalizeWorkerDraft, validateWorkerDraft, checkWorkerForStep, relatedUndelivered } from "./qualification-rules.js";
+import { qualificationPage } from "./qualification-page.js";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const dbPath = join(__dirname, "data", "cyanotype-negative-room.json");
 const port = Number(process.env.PORT || 3040);
-const seed = {
-  "items": [
-    {
-      "code": "CN-001",
-      "plateSize": "18x24cm",
-      "chemicalBatch": "B-0620",
-      "exposure": "8分钟",
-      "waterSource": "井水过滤",
-      "box": "蓝盒A-03",
-      "status": "冲洗中",
-      "defect": "边角显影不均",
-      "logs": [
-        {
-          "at": "2026-06-20",
-          "step": "曝光",
-          "note": "阴天补时2分钟"
-        }
-      ]
-    }
-  ]
-};
 const fields = [["code","底片编号","text"],["plateSize","玻璃板尺寸","text"],["chemicalBatch","药液批次","text"],["exposure","曝光时间","text"],["waterSource","冲洗水源","text"],["box","存放盒位","text"]];
-const stages = ["待曝光","冲洗中","待入盒","已交付"];
-const statLabels = ["待曝光","冲洗中","待入盒","已交付"];
+const stages = ["待曝光","冲洗中","待入盒","待复核","已交付"];
+const statLabels = ["待曝光","冲洗中","待入盒","待复核","已交付"];
 const extraFields = [["step","步骤"],["developStatus","显影状态"],["defect","缺陷类型"],["repair","修补记录"],["note","备注"]];
 
-async function loadDb() {
-  if (!existsSync(dbPath)) {
-    await mkdir(dirname(dbPath), { recursive: true });
-    await writeFile(dbPath, JSON.stringify(seed, null, 2));
-  }
-  return JSON.parse(await readFile(dbPath, "utf8"));
-}
-async function saveDb(db) { await writeFile(dbPath, JSON.stringify(db, null, 2)); }
 async function body(req) {
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
@@ -86,15 +54,17 @@ function page() {
     .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:12px; } .card { display:grid; gap:8px; }
     .meta { color:var(--muted); font-size:13px; } .pill { display:inline-block; border:1px solid var(--line); border-radius:999px; padding:3px 8px; font-size:12px; }
     .logs { border-top:1px solid var(--line); padding-top:8px; max-height:90px; overflow:auto; } .warn { color:var(--warn); font-weight:700; }
+    header a { color:var(--accent); font-weight:700; text-decoration:none; margin-right:12px; }
+    #actionMsg { margin-top:8px; }
     @media (max-width:900px){ header{display:block;padding:18px 16px;} main{grid-template-columns:1fr;padding:16px;} }
   </style>
 </head>
 <body>
-  <header><div><h1>古法蓝晒底片整理室</h1><div class="meta">底片任务、工艺步骤、缺陷和入盒交付</div></div><button id="reload">刷新</button></header>
+  <header><div><h1>古法蓝晒底片整理室</h1><div class="meta">底片任务、工艺步骤、缺陷和入盒交付</div></div><div><a href="/qualifications">上岗资格台</a><button id="reload">刷新</button></div></header>
   <main>
     <section>
       <form id="createForm"><h2>新增底片</h2><div id="fields"></div><label>初始状态</label><select name="status">${stages.map(s => '<option>'+s+'</option>').join('')}</select><button>保存底片</button></form>
-      <form id="actionForm" style="margin-top:14px"><h2>记录工艺步骤</h2><label>选择底片</label><select name="id" id="itemSelect"></select><div id="extraFields"></div><button>提交记录</button></form>
+      <form id="actionForm" style="margin-top:14px"><h2>记录工艺步骤</h2><label>选择底片</label><select name="id" id="itemSelect"></select><label>操作人（涂布/曝光/冲洗必选）</label><select name="workerId" id="workerSelect"><option value="">— 不指定 —</option></select><div id="extraFields"></div><button>提交记录</button><div id="actionMsg" class="warn"></div></form>
     </section>
     <section>
       <div class="stats" id="stats"></div>
@@ -104,18 +74,21 @@ function page() {
   </main>
   <script>
     const fields = [["code","底片编号","text"],["plateSize","玻璃板尺寸","text"],["chemicalBatch","药液批次","text"],["exposure","曝光时间","text"],["waterSource","冲洗水源","text"],["box","存放盒位","text"]];
-    const stages = ["待曝光","冲洗中","待入盒","已交付"];
+    const stages = ["待曝光","冲洗中","待入盒","待复核","已交付"];
     const extraFields = [["step","步骤"],["developStatus","显影状态"],["defect","缺陷类型"],["repair","修补记录"],["note","备注"]];
     const createForm = document.querySelector('#createForm');
     const actionForm = document.querySelector('#actionForm');
     const cards = document.querySelector('#cards');
     const statsEl = document.querySelector('#stats');
     const itemSelect = document.querySelector('#itemSelect');
+    const workerSelect = document.querySelector('#workerSelect');
+    const actionMsg = document.querySelector('#actionMsg');
     let items = [];
+    let workers = [];
     async function api(path, options) {
       const res = await fetch(path, options && options.body ? { ...options, headers:{ 'Content-Type':'application/json' } } : options);
       const data = await res.json();
-      if (!res.ok) throw new Error(data.error || '请求失败');
+      if (!res.ok) { const err = new Error(data.error || '请求失败'); err.data = data; throw err; }
       return data;
     }
     function renderForms() {
@@ -124,6 +97,7 @@ function page() {
     }
     function render() {
       itemSelect.innerHTML = items.map(item => '<option value="'+(item.id || item.code)+'">'+(item.code || item.id)+' · '+(item.name || item.shipType || item.source || item.plateSize || '')+'</option>').join('');
+      workerSelect.innerHTML = '<option value="">— 不指定 —</option>' + workers.map(w => '<option value="'+w.id+'">'+w.name+' · '+w.team+'（'+(w.skills || []).join('/')+'）</option>').join('');
       const stats = Object.fromEntries(stages.map(s => [s, items.filter(i => i.status === s).length]));
       statsEl.innerHTML = Object.entries(stats).map(([k,v]) => '<div class="stat"><span>'+k+'</span><strong>'+v+'</strong></div>').join('');
       const status = document.querySelector('#statusFilter').value;
@@ -139,9 +113,23 @@ function page() {
       const logs = (item.logs || []).slice(-4).map(l => '<div>'+l.step+'：'+l.note+'</div>').join('');
       return '<article class="card"><h3>'+(item.code || item.id)+'</h3><span class="pill">'+item.status+'</span>'+main+tasks+'<label>状态</label><select data-status="'+(item.id || item.code)+'">'+stages.map(s => '<option '+(s===item.status?'selected':'')+'>'+s+'</option>').join('')+'</select><button class="secondary" data-note="'+(item.id || item.code)+'">追加备注</button><div class="logs meta">'+(logs || '暂无记录')+'</div></article>';
     }
-    async function load() { items = await api('/api/items'); render(); }
+    async function load() {
+      const results = await Promise.all([api('/api/items'), api('/api/workers')]);
+      items = results[0]; workers = results[1];
+      render();
+    }
     createForm.onsubmit = async event => { event.preventDefault(); await api('/api/items', { method:'POST', body: JSON.stringify(Object.fromEntries(new FormData(createForm).entries())) }); createForm.reset(); await load(); };
-    actionForm.onsubmit = async event => { event.preventDefault(); await api('/api/items/'+itemSelect.value+'/action', { method:'POST', body: JSON.stringify(Object.fromEntries(new FormData(actionForm).entries())) }); actionForm.reset(); await load(); };
+    actionForm.onsubmit = async event => {
+      event.preventDefault();
+      actionMsg.innerHTML = '';
+      try {
+        await api('/api/items/'+itemSelect.value+'/action', { method:'POST', body: JSON.stringify(Object.fromEntries(new FormData(actionForm).entries())) });
+        actionForm.reset(); await load();
+      } catch (err) {
+        const reasons = err.data && err.data.reasons ? err.data.reasons : [err.message];
+        actionMsg.innerHTML = reasons.map(r => '<div>'+r+'</div>').join('');
+      }
+    };
     document.querySelector('#statusFilter').onchange = render; document.querySelector('#search').oninput = render; document.querySelector('#reload').onclick = load;
     renderForms(); load();
   </script>
@@ -154,11 +142,46 @@ const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
     const db = await loadDb();
     if (req.method === "GET" && url.pathname === "/") return html(res, page());
+    if (req.method === "GET" && url.pathname === "/qualifications") return html(res, qualificationPage());
     if (req.method === "GET" && url.pathname === "/api/items") return send(res, 200, db.items.map(summarize));
+    if (req.method === "GET" && url.pathname === "/api/workers") return send(res, 200, db.workers);
+    if (req.method === "POST" && url.pathname === "/api/workers") {
+      const draft = normalizeWorkerDraft(await body(req));
+      const check = validateWorkerDraft(draft);
+      if (!check.ok) return send(res, 400, { error: "师傅登记未通过，未写入", reasons: check.errors });
+      const worker = { id: newWorkerId(), ...draft, createdAt: new Date().toISOString(), history: [] };
+      db.workers.push(worker);
+      await saveDb(db);
+      return send(res, 201, worker);
+    }
+    const workerPatch = url.pathname.match(/^\/api\/workers\/([^/]+)$/);
+    if (workerPatch && req.method === "PATCH") {
+      const worker = findWorker(db, decodeURIComponent(workerPatch[1]));
+      if (!worker) return send(res, 404, { error: "worker_not_found" });
+      const draft = normalizeWorkerDraft({ ...worker, ...(await body(req)) });
+      const check = validateWorkerDraft(draft);
+      if (!check.ok) return send(res, 400, { error: "师傅资料修改未通过，未写入", reasons: check.errors });
+      const changed = [];
+      if (draft.team !== worker.team) changed.push("班组");
+      if (JSON.stringify(draft.periods) !== JSON.stringify(worker.periods)) changed.push("在岗时段");
+      if (draft.certValidUntil !== worker.certValidUntil) changed.push("证书有效期");
+      Object.assign(worker, draft);
+      worker.updatedAt = new Date().toISOString();
+      worker.history ||= [];
+      worker.history.push({ at: worker.updatedAt, note: changed.length ? "变更：" + changed.join("、") : "资料更新" });
+      const bounced = changed.length ? relatedUndelivered(db.items, worker.id) : [];
+      for (const item of bounced) {
+        item.status = "待复核";
+        item.logs ||= [];
+        item.logs.push({ at: worker.updatedAt, step: "资格复核", note: `操作人 ${worker.name} 的${changed.join("、")}变更，底片退回待复核` });
+      }
+      await saveDb(db);
+      return send(res, 200, { worker, bounced: bounced.map(i => i.code || i.id) });
+    }
     if (req.method === "POST" && url.pathname === "/api/items") {
       const input = await body(req);
       const item = { id: newId(), ...input, logs: [{ at: new Date().toISOString(), step: "建档", note: "创建底片" }] };
-      
+
       db.items.unshift(item);
       await saveDb(db);
       return send(res, 201, item);
@@ -188,15 +211,26 @@ const server = http.createServer(async (req, res) => {
       const item = db.items.find(x => x.id === action[1] || x.code === action[1]);
       if (!item) return send(res, 404, { error: "item_not_found" });
       const input = await body(req);
+      const step = input.step || "";
+      const workerId = input.workerId || "";
+      if (QUALIFIED_STEPS.includes(step) && !workerId) {
+        return send(res, 409, { error: "上岗校验未通过，原记录未写入", reasons: [`提交「${step}」必须选择登记在册的师傅`] });
+      }
+      let worker = null;
+      if (workerId) {
+        worker = findWorker(db, workerId);
+        const check = checkWorkerForStep(worker, step);
+        if (!check.ok) return send(res, 409, { error: "上岗校验未通过，原记录未写入", reasons: check.reasons });
+      }
       item.logs ||= [];
       item.steps ||= [];
-      item.steps.push({ at: new Date().toISOString(), ...input });
+      item.steps.push({ at: new Date().toISOString(), ...input, ...(worker ? { workerId: worker.id, workerName: worker.name, workerTeam: worker.team } : {}) });
       if (input.defect) item.defect = input.defect;
       if (input.step === "冲洗") item.status = "冲洗中";
       else if (input.step === "入盒") item.status = "待入盒";
       else if (input.step === "交付") item.status = "已交付";
       else item.status = "待曝光";
-      item.logs.push({ at: new Date().toISOString(), step: input.step || "工艺", note: input.note || input.developStatus || "步骤记录" });
+      item.logs.push({ at: new Date().toISOString(), step: input.step || "工艺", note: (worker ? `操作人 ${worker.name}（${worker.team}）；` : "") + (input.note || input.developStatus || "步骤记录") });
       await saveDb(db);
       return send(res, 201, item);
     }
